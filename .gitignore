@@ -1,0 +1,34 @@
+# Your live config (host paths, model choices, any auth tokens). Tracked
+# template lives in .env.example — copy it to .env and edit.
+.env
+# Variants (.env.local, .env.bak, ...) carry the same secrets; only the template is tracked.
+.env.*
+!.env.example
+
+# Your backends plugin (host servers airlock may start/stop). Machine-specific host
+# code; start from templates/backends.example.sh, or symlink your own file here.
+/backends.sh
+
+# Per-tool state (credentials, caches) lives here between rebuilds — never
+# commit it. Keep the directory skeleton via the .gitkeep files.
+state/*/*
+!state/*/.gitkeep
+
+# The default bind mount (used when `harness <cmd>` is run with no project dir).
+# Agent runs land test artifacts here — keep the dir, ignore its contents.
+workspace/*
+!workspace/.gitkeep
+
+# macOS junk
+.DS_Store
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Dropped-in source archives — don't commit.
+*.zip
+
+# Private working notes (read by CLAUDE.md if present) and local Claude Code settings.
+.local/
+.claude/

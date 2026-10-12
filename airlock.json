@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "Kit-level build config: what gets baked into the sandbox image. Not per project,",
+    "not secret — trim it so a sandbox carries the tools you actually use.",
+    "'harnesses' are the CLIs a project may pick (opencode | claude | codex | copilot); a",
+    "project's HARNESS= must be one of them. 'stacks' names the STACK= values and the",
+    "components each one installs (node | python | java | angular | dotnet); node is",
+    "required by the harness CLIs and Angular. Version pins stay in .env.",
+    "Playwright + headless Chromium is not a kit setting: a project opts in with",
+    "COMPONENTS=playwright (added to its stack's set; the wizard asks), default off.",
+    "Each stack's components also decide its egress whitelist blocks (node ->",
+    "stack-node, python -> stack-python, java -> stack-java, dotnet -> stack-dotnet).",
+    "A project's COMPONENTS= overrides its stack's set (build args AND blocks), and",
+    "only the project's ONE HARNESS is installed — so",
+    "'harnesses' is the set a project may pick from, not what every image carries.",
+    "A project with no config gets the first-launch wizard (at a terminal) or a",
+    "refusal naming 'airlock init --stack <s>'; 'init' defaults to 'base'.",
+    "AIRLOCK_KIT_CONFIG=<path> points airlock at a different file."
+  ],
+  "harnesses": ["opencode", "claude", "codex", "copilot"],
+  "stacks": {
+    "base":         { "node": true, "python": true },
+    "java-angular": { "node": true, "python": true, "java": true, "angular": true },
+    "dotnet":       { "node": true, "dotnet": true },
+    "node":         { "node": true }
+  }
+}

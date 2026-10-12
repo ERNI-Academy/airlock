@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "endpoint": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Endpoint (OpenAI-compatible server on the host)",
+      "options": {
+        "baseURL": "http://llm:8080/v1",
+        "apiKey": "__LLM_KEY__"
+      },
+      "models": {
+        "__LLM_MODEL__": {
+          "name": "__LLM_MODEL__",
+          "limit": {
+            "context": __LLM_CONTEXT__,
+            "output": __LLM_OUTPUT__
+          }
+        }
+      }
+    }
+  },
+  "model": "endpoint/__LLM_MODEL__",
+  "compaction": {
+    "auto": false,
+    "prune": true
+  }
+}

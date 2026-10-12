@@ -1,0 +1,223 @@
+# The sandbox engine: the sandbox, two doors, and two networks.
+#
+#   dev ──(internal network: no way out)──> proxy ──(egress network)──> internet (whitelist only)
+#                                      └──> llm ────(egress network)──> ONE port on your host
+#
+# The trick is the `internal: true` network at the bottom: containers on it
+# have no route to the internet or the host AT ALL. The only reachable
+# machines are `proxy` and `llm`, which straddle both networks and act as
+# controlled doors. This is what makes escapes impossible rather than just
+# discouraged.
+#
+# There is exactly ONE `llm` door and it forwards to exactly ONE host port; it
+# answers to `llm2`/`llm3` as aliases only. With LOCAL_MODEL=off it is not started
+# at all, and then no host port is reachable from the sandbox.
+services:
+
+  # The sandbox itself. Your code is mounted at /workspace; harnesses
+  # (opencode, Claude Code, Codex, Copilot) run in here. It sits ONLY on the internal
+  # network.
+  dev:
+    build:
+      # Build context. Default ./dev (the core recipe). DEV_CONTEXT is the escape
+      # hatch for recipes that live outside dev/ (callers export DEV_CONTEXT together with
+      # DEV_DOCKERFILE. Relative paths resolve against the repo root (bin/harness
+      # passes --project-directory); an absolute path works too.
+      context: ${DEV_CONTEXT:-./dev}
+      # Which image recipe to build, relative to the context. There is ONE
+      # parametrised recipe now (dev/Dockerfile, driven by the args below);
+      # DEV_DOCKERFILE stays as the escape hatch for pre-built images, which
+      # carry pre-warmed dependency caches and must not be parametrised.
+      dockerfile: ${DEV_DOCKERFILE:-Dockerfile}
+      args:
+        # What goes into the image. `bin/airlock` sets these from the repo-root
+        # airlock.json + the project's STACK=/COMPONENTS=; the defaults here are the
+        # base image (node + python, all four harnesses, no Playwright) for raw
+        # `docker compose build` and `bin/harness` callers.
+        HARNESSES: ${AIRLOCK_HARNESSES:-opencode claude codex copilot}
+        WITH_PLAYWRIGHT: ${AIRLOCK_WITH_PLAYWRIGHT:-0}
+        WITH_NODE: ${AIRLOCK_WITH_NODE:-1}
+        WITH_PYTHON: ${AIRLOCK_WITH_PYTHON:-1}
+        WITH_JAVA: ${AIRLOCK_WITH_JAVA:-0}
+        WITH_ANGULAR: ${AIRLOCK_WITH_ANGULAR:-0}
+        WITH_DOTNET: ${AIRLOCK_WITH_DOTNET:-0}
+        # Harness versions baked into the image. `latest` unless you pin them
+        # in .env for reproducible builds.
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+        CODEX_VERSION: ${CODEX_VERSION:-latest}
+        OPENCODE_VERSION: ${OPENCODE_VERSION:-latest}
+        COPILOT_VERSION: ${COPILOT_VERSION:-latest}
+        # Component version pins (used by the components they name; ignored when
+        # that component is off). Pin in .env for repeatable builds.
+        ANGULAR_VERSION: ${ANGULAR_VERSION:-latest}
+        JDK_VERSION: ${JDK_VERSION:-25}
+        DOTNET_VERSION: ${DOTNET_VERSION:-10.0.203}
+        # Playwright + headless Chromium (COMPONENTS=playwright). Pin for reproducible browser builds.
+        PLAYWRIGHT_VERSION: ${PLAYWRIGHT_VERSION:-latest}
+      # Who built this image, for `airlock gc`. Set here rather than as a
+      # LABEL in each Dockerfile so every recipe carries them and
+      # no layer cache is touched. launcher=airlock + home=<AIRLOCK_HOME> only when
+      # bin/airlock launched it; raw bin/harness callers get
+      # launcher=harness, which gc never removes.
+      labels:
+        io.airlock.sandbox: "1"
+        io.airlock.project: ${COMPOSE_PROJECT_NAME:-}
+        io.airlock.launcher: ${AIRLOCK_LAUNCHER:-harness}
+        io.airlock.home: ${AIRLOCK_IMAGE_HOME:-}
+    command: sleep infinity        # keeps the container alive; you exec/attach into it
+    networks: [internal]
+    # Nothing in here needs a Linux capability: the agent edits files, runs builds
+    # and talks to two containers. Dropping them all costs nothing and removes the
+    # usual container-escape primitives; no-new-privileges makes sure a setuid
+    # binary in the image (or one an agent installs) cannot regain them.
+    # Tested on the base stack: opencode, claude, `git commit`, `npm install`
+    # through the proxy and a headless Playwright Chromium launch all behave
+    # identically with and without these two lines. (Chromium's own sandbox needs
+    # --no-sandbox in this image either way — unprivileged user namespaces are not
+    # available to the container regardless of capabilities.)
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      # Well-behaved tools (curl, npm, pip, git, ...) read these and send
+      # their traffic through the proxy. Tools that ignore them don't get a
+      # free pass — they simply have no route and fail.
+      HTTP_PROXY: http://proxy:3128
+      HTTPS_PROXY: http://proxy:3128
+      http_proxy: http://proxy:3128
+      https_proxy: http://proxy:3128
+      # ...except for these hosts, which are reached directly (the LLM
+      # forwarder lives on the internal network, no proxy needed).
+      NO_PROXY: llm,llm2,llm3,localhost,127.0.0.1
+      no_proxy: llm,llm2,llm3,localhost,127.0.0.1
+      # OpenRouter key: only for callers that put it in .env and
+      # dev/opencode/opencode.json's `openrouter` providers read it. Under airlock
+      # it comes from the project's own secrets file and is empty unless
+      # HARNESS=opencode.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      # The JVM ignores HTTP(S)_PROXY env vars — it needs proxy *system
+      # properties*. Without this, Gradle/Maven (wrapper + daemon) try a direct
+      # connection and fail with UnknownHostException on the internal network.
+      JAVA_TOOL_OPTIONS: >-
+        -Dhttp.proxyHost=proxy -Dhttp.proxyPort=3128
+        -Dhttps.proxyHost=proxy -Dhttps.proxyPort=3128
+        -Dhttp.nonProxyHosts=localhost|127.0.0.1|llm|llm2|llm3
+      # OpenAI-compatible endpoint for any harness/SDK inside the sandbox.
+      # Default: the local LLM door. Override in .env, e.g. to point Codex at the
+      # real OpenAI API — which also needs .openai.com on the egress whitelist.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://llm:8080/v1}
+      # `-` and NOT `:-`: the default must apply only when the variable is UNSET.
+      # `airlock` exports every credential name EMPTY for a harness that cannot use
+      # it (0014), and `:-local` would have substituted the default right back over
+      # that empty value — which is exactly what `airlock verify` caught. Raw callers
+      # export nothing, so they get the placeholder "local" (most local servers
+      # ignore the key); the picker sets the real one (LLM_KEY, or a plugin's).
+      OPENAI_API_KEY: ${OPENAI_API_KEY-local}
+      LLM_MODEL: ${LLM_MODEL:-local-model}
+      # Load our (read-only) provider config from the neutral mount above,
+      # keeping ~/.config/opencode writable for opencode's own runtime files.
+      OPENCODE_CONFIG: /etc/opencode/opencode.json
+      # Keep the harnesses quiet on the network: no self-updates (the image
+      # pins the versions anyway) and no Claude Code telemetry/error reporting
+      # (statsig, sentry) — this is what keeps the squid whitelist small.
+      DISABLE_AUTOUPDATER: "1"
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+      # Claude Code knobs, all optional:
+      # - ANTHROPIC_MODEL: empty = Claude Code picks its default.
+      # - CLAUDE_CODE_OAUTH_TOKEN: headless auth from `claude setup-token`.
+      # - ANTHROPIC_API_KEY: the API-key alternative to the OAuth token.
+      # Under airlock the two credentials come from the PROJECT's secrets file
+      # (~/.airlock/<project>-<hash6>/env) and are passed in EMPTY unless the
+      # project's HARNESS is `claude` — the exported empty value deliberately
+      # overrides both .env and whatever is in the launching shell.
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_CODE_OAUTH_TOKEN:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # The project directory. `bin/harness` sets WORKSPACE.
+      - ${WORKSPACE:-./workspace}:/workspace
+      # opencode config, read-only (:ro) so an agent can't rewrite its own
+      # settings. Mounted at a NEUTRAL path (not ~/.config/opencode) and loaded
+      # via OPENCODE_CONFIG below — opencode writes runtime files (.gitignore,
+      # auth, cache) into ~/.config/opencode, so that dir must stay writable.
+      # Mounted as a DIRECTORY so host edits are picked up without recreating
+      # the container (a single-file bind mount goes stale on colima when the
+      # editor replaces the file via atomic rename).
+      # The model picker points OPENCODE_DIR elsewhere: the per-project render
+      # of dev/opencode-endpoint, or the config dir a backends plugin names.
+      - ${OPENCODE_DIR:-./dev/opencode}:/etc/opencode:ro
+      # Per-tool state, persisted OUTSIDE the container: log in once inside
+      # the sandbox and the credentials/settings survive rebuilds. Under
+      # airlock these vars are always set to the project's control dir
+      # (~/.airlock/<project>-<hash>/state/, outside the mounted project tree;
+      # per-client identities, overridable in that config) — the ./state/ fallback
+      # only serves raw `bin/harness` callers. You
+      # can point these at host config dirs — but note: on macOS Claude Code
+      # stores host credentials in the Keychain, so mounting your host
+      # ~/.claude does NOT carry auth into the container. gh (~/.config/gh)
+      # and codex (~/.codex) keep theirs in plain files and CAN be shared.
+      - ${CLAUDE_STATE:-./state/claude}:/home/dev/.claude
+      - ${CODEX_STATE:-./state/codex}:/home/dev/.codex
+      - ${GH_STATE:-./state/gh}:/home/dev/.config/gh
+      - ${COPILOT_STATE:-./state/copilot}:/home/dev/.copilot
+    # Only the proxy. The LLM door is optional (LOCAL_MODEL=off removes it), and a
+    # hard dependency would make compose pull it back in.
+    depends_on: [proxy]
+
+  # The only web door. Squid checks every request against the whitelist in
+  # proxy/squid.conf and denies everything else. It is on BOTH networks:
+  # it hears requests on `internal` and forwards allowed ones via `egress`.
+  proxy:
+    image: ubuntu/squid:latest
+    networks: [internal, egress]
+    volumes:
+      - ./proxy/squid.conf:/etc/squid/squid.conf:ro
+      # Per-project extra domain whitelist. A project stub can point
+      # EXTRA_WHITELIST at its own file; defaults to a placeholder otherwise.
+      - ${EXTRA_WHITELIST:-./proxy/extra-whitelist.txt}:/etc/squid/extra-whitelist.txt:ro
+
+  # THE LLM door — one service, one target, three names.
+  #
+  # ONE container, forwarding to ONE host port, ${LLM_HOST}:${LLM_TARGET_PORT}, set by
+  # the model picker in bin/sandbox-run (endpoint → LLM_PORT, a backends plugin's
+  # picker → its BK_PORT). Only the selected backend's port is reachable, and with
+  # LOCAL_MODEL=off none is.
+  #
+  # The door also answers as `llm2:8000` and `llm3:8090` (network aliases plus three
+  # socat listeners in the one container) besides `llm:8080`, so a plugin or opencode
+  # config may use a distinct hostname per backend. All three names reach the same
+  # single host port: the names are aliases; the target is singular.
+  #
+  # Profile-gated so it can be absent entirely: `bin/harness` adds the `llm` profile
+  # by default (raw callers keep exactly today's reachability),
+  # and `bin/sandbox-run` sets LLM_DOOR=0 for LOCAL_MODEL=off, which drops the
+  # profile and removes the container — `llm`/`llm2`/`llm3` then do not resolve.
+  # `dev` deliberately does NOT depend on it; a missing door is a normal state.
+  #
+  # LLM_HOST defaults to this machine; it may name another box (a LAN GPU server) —
+  # that is the engineer's own machine to choose. Both come from the project's
+  # config via `airlock`, or from .env.
+  llm:
+    profiles: [llm]
+    image: alpine/socat:latest
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >-
+        socat TCP-LISTEN:8080,fork,reuseaddr TCP:${LLM_HOST:-host.docker.internal}:${LLM_TARGET_PORT:-8000} &
+        socat TCP-LISTEN:8000,fork,reuseaddr TCP:${LLM_HOST:-host.docker.internal}:${LLM_TARGET_PORT:-8000} &
+        socat TCP-LISTEN:8090,fork,reuseaddr TCP:${LLM_HOST:-host.docker.internal}:${LLM_TARGET_PORT:-8000} &
+        wait
+    networks:
+      internal:
+        # Extra hostnames for the same door (see above): same container, same target.
+        aliases: [llm2, llm3]
+      egress:
+    extra_hosts:
+      - host.docker.internal:host-gateway   # makes the host resolvable from the container
+
+networks:
+  # `internal: true` = Docker creates this network WITHOUT a gateway to the
+  # outside. Not a firewall rule — the route simply does not exist.
+  internal:
+    internal: true
+  # A normal bridge network with internet access; only proxy and llm are on it.
+  egress:

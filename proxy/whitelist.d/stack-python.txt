@@ -1,0 +1,5 @@
+# Python — pip. Both hosts are needed: the index redirects downloads to the CDN.
+# pip index:
+.pypi.org
+# pip actually downloads the files here:
+.pythonhosted.org

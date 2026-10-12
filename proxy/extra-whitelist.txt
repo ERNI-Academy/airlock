@@ -1,0 +1,21 @@
+# The DEFAULT egress whitelist — the one compose mounts when nothing sets
+# EXTRA_WHITELIST, i.e. for raw `bin/harness` / `docker compose` callers with no
+# project config.
+#
+# `airlock` never reads this file. It composes a per-project list from the blocks in
+# proxy/whitelist.d/ (the project's STACK + its HARNESS + its own WHITELIST=) into
+# the project's control dir and points EXTRA_WHITELIST there. squid.conf itself
+# carries NO domains at all — this file, or the generated one, is the whole list.
+#
+# Contents: what STACK=base needs and nothing else — a copy of
+# proxy/whitelist.d/stack-node.txt + stack-python.txt. No harness vendor block: a raw
+# caller that runs a cloud harness points EXTRA_WHITELIST at a list that has one.
+#
+# Node / npm — every stack ships Node (the harness CLIs are npm packages).
+# npm registry:
+.npmjs.org
+# Python — pip. Both hosts are needed: the index redirects downloads to the CDN.
+# pip index:
+.pypi.org
+# pip actually downloads the files here:
+.pythonhosted.org

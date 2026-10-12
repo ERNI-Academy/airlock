@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+#
+# Shared sandbox runner — all the logic lives here, in the harness repo. It is the
+# single source of truth for everything the HOST has to do around the container;
+# `bin/airlock` translates a project's config into the variables below and execs
+# this, and scripted callers call `bin/harness` directly.
+#
+# Inputs (via environment):
+#   PROJECT          required — the project dir to sandbox (mounted at /workspace)
+#   DEV_DOCKERFILE   optional — image stack (default: Dockerfile)
+#   LOCAL_MODEL      optional — backend picker (endpoint | off | ask | a plugin's name)
+#   LLM_HOST/PORT/MODEL/KEY/CONTEXT/OUTPUT   the `endpoint` backend's server
+#   AIRLOCK_BACKENDS optional — the backends plugin file (default: backends.sh at
+#                    the kit root, used only if it exists)
+#
+# Subcommands: shell (default) | oc | claude | codex | copilot | run <cmd…> |
+# verify | down | stop | deps.
+set -euo pipefail
+
+# Self-locate the repo from this script's own path — no hardcoded path needed.
+HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HARNESS="$HARNESS_DIR/bin/harness"
+
+# PROJECT is the one required input.
+: "${PROJECT:?set PROJECT (the dir to sandbox); airlock does this for you}"
+
+# ── backends plugin ──────────────────────────────────────────────────────────
+# The kit ships two backends: `endpoint` (a server you already run, health-checked
+# only) and `off` (no door). Servers this machine should START and STOP itself — a
+# llama-server, an MLX server, anything with a start command — are registered by a
+# plugin: a shell file sourced here — backends.sh at the kit root (git-ignored; copy
+# templates/backends.example.sh), or whatever AIRLOCK_BACKENDS names. It is host-side
+# config like .env and is never mounted into the sandbox. The plugin sets
+#   BACKENDS_EXTRA="name1 name2"   the extra picker names, in menu order
+#   BACKENDS_DEFAULT=name1         optional: the `ask` default (and its non-TTY fallback)
+# and defines one function per name, backend_<name>, which sets the BK_* fields
+# read by bk_load below. The mechanics (health check, start + wait, exclusive
+# stop, door port, opencode dir) stay here, so a plugin is a page of settings.
+# README.md, "LLM backends", has a complete example.
+BACKENDS_EXTRA="" BACKENDS_DEFAULT=""
+. "$HARNESS_DIR/bin/lib/airlock-backends.sh"
+BACKENDS_FILE="$(backends_file)"
+if [[ -f "$BACKENDS_FILE" ]]; then
+  # shellcheck disable=SC1090
+  . "$BACKENDS_FILE"
+fi
+
+# squid.conf holds no domains any more: the effective list is the file the proxy
+# mounts — the per-project one airlock composed (EXTRA_WHITELIST) or, for raw
+# callers, proxy/extra-whitelist.txt. Look in exactly the one that is in force.
+wl_file() {
+  if [[ -n "${EXTRA_WHITELIST:-}" && -f "$EXTRA_WHITELIST" ]]; then
+    printf '%s' "$EXTRA_WHITELIST"
+  else
+    printf '%s' "$HARNESS_DIR/proxy/extra-whitelist.txt"
+  fi
+}
+
+# Which opencode provider config gets mounted at /etc/opencode. `airlock` sets
+# OPENCODE_DIR_PINNED=1 when the project's HARNESS is not opencode: an empty
+# placeholder is then mounted deliberately (a provider config names a base URL, a
+# model and an API key, and the selected harness cannot use any of them), and the
+# model picker below must not put a real one back.
+OPENCODE_DIR_PINNED="${OPENCODE_DIR_PINNED:-0}"
+oc_dir() { [[ "$OPENCODE_DIR_PINNED" == "1" ]] || export OPENCODE_DIR="$1"; }
+
+# ── who gets the OpenAI-compatible endpoint ───────────────────────────────────
+# OPENAI_BASE_URL/OPENAI_API_KEY describe the local backend. opencode and codex
+# read them; Claude Code and the Copilot CLI cannot use either, and OPENAI_API_KEY
+# is a credential — handing it to a harness that has no use for it is exactly what
+# 0014 closed, and `airlock verify` FAILs on it ("credential for an unselected
+# harness"). So the picker still starts the backend and still opens the door when
+# the project asked for one; it just does not pass the env in.
+# Raw `bin/harness` callers set no AIRLOCK_HARNESS at all: unchanged.
+llm_env_wanted() {
+  case "${AIRLOCK_HARNESS:-}" in ''|opencode|codex) return 0 ;; esac
+  return 1
+}
+
+llm_env() {   # <base-url> <key> — export them, or say once why not
+  if llm_env_wanted; then
+    export OPENAI_BASE_URL="$1" OPENAI_API_KEY="$2"
+  else
+    echo "model: HARNESS=${AIRLOCK_HARNESS} does not use an OpenAI-compatible endpoint — backend and door as configured, but OPENAI_BASE_URL/OPENAI_API_KEY are not passed in."
+  fi
+}
+
+pid_alive() { [[ -f "$1" ]] && kill -0 "$(cat "$1" 2>/dev/null)" 2>/dev/null; }
+
+# Every "id" a /v1/models body lists, one per line. One JSON field per line
+# ({ } , → newline), then pull out the ids — no jq on a bare host.
+models_ids() { tr '{},' '\n\n\n' | sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'; }
+
+# ── plugin backends ───────────────────────────────────────────────────────────
+# bk_known <name>: is it a picker the plugin registered (and defined)?
+bk_known() {
+  case " $BACKENDS_EXTRA " in *" $1 "*) ;; *) return 1 ;; esac
+  declare -F "backend_$1" >/dev/null
+}
+
+# bk_load <name>: reset the BK_* fields to their defaults, then let the plugin's
+# backend_<name> fill them in. Fields (only BK_PORT and BK_MODEL are required):
+#   BK_LABEL          the menu line                         (default: the name)
+#   BK_PORT           host port the door forwards to (LLM_TARGET_PORT)
+#   BK_MODEL          model id the server serves (LLM_MODEL)
+#   BK_URL            base URL inside the sandbox            (http://llm:8080/v1)
+#   BK_KEY            API key, for the sandbox and the probe (local)
+#   BK_HEALTH_URL     host-side probe            (http://127.0.0.1:$BK_PORT/v1/models)
+#   BK_CHECK_ID       1 = "up" only if the probe lists BK_MODEL — for two
+#                     models that take turns on one port      (0: answering is enough)
+#   BK_START/BK_STOP  host commands; no BK_START = health check only
+#   BK_WAIT           seconds to wait for a start            (120)
+#   BK_PIDFILE        a live pid here counts as running (a server still loading)
+#   BK_HINT           printed when the start times out
+#   BK_OPENCODE_DIR   the opencode config dir for /etc/opencode (dev/opencode)
+#   BK_EXCLUSIVE_WITH names stopped (if running) before this one starts
+bk_load() {
+  BK_NAME="$1" BK_LABEL="$1" BK_PORT="" BK_MODEL="" BK_URL="http://llm:8080/v1" BK_KEY="local"
+  BK_HEALTH_URL="" BK_CHECK_ID=0 BK_START="" BK_STOP="" BK_WAIT=120 BK_PIDFILE="" BK_HINT=""
+  BK_OPENCODE_DIR="$HARNESS_DIR/dev/opencode" BK_EXCLUSIVE_WITH=""
+  "backend_$1"
+  [[ -n "$BK_PORT" && -n "$BK_MODEL" ]] || {
+    echo "sandbox-run: backend_$1 in $BACKENDS_FILE must set BK_PORT and BK_MODEL." >&2; exit 1; }
+  BK_HEALTH_URL="${BK_HEALTH_URL:-http://127.0.0.1:${BK_PORT}/v1/models}"
+}
+
+# Probes on the loaded backend. "up" = serving it; "running" = up, or launched and
+# still loading (pidfile alive) — the exclusive stop needs both, or a loading
+# server would block the next start.
+bk_probe() { curl -fsS -m 2 -H "Authorization: Bearer ${BK_KEY}" "$BK_HEALTH_URL" 2>/dev/null; }
+bk_up() {
+  if [[ "$BK_CHECK_ID" == "1" ]]; then
+    bk_probe | models_ids | grep -qx -- "$BK_MODEL"
+  else
+    bk_probe >/dev/null
+  fi
+}
+bk_running() { bk_up || { [[ -n "$BK_PIDFILE" ]] && pid_alive "$BK_PIDFILE"; }; }
+bk_stop() {
+  [[ -n "$BK_STOP" ]] || return 0
+  echo "$BK_NAME: stopping via: $BK_STOP"
+  # shellcheck disable=SC2086
+  ${BK_STOP} || true
+}
+
+# Start the selected plugin backend: stop the ones it is exclusive with, then
+# ensure_backend. After stopping one on the same port, wait for the port to go
+# quiet — a start script may refuse while something still answers there.
+bk_ensure() {   # <name>
+  local name="$1" port other
+  bk_load "$name"; port="$BK_PORT"
+  for other in $BK_EXCLUSIVE_WITH; do
+    bk_known "$other" || continue
+    bk_load "$other"
+    if bk_running; then
+      echo "$name exclusive: stopping $other"
+      bk_stop
+      if [[ "$BK_PORT" == "$port" ]]; then
+        for _ in $(seq 1 30); do bk_probe >/dev/null || break; sleep 1; done
+      fi
+    fi
+  done
+  bk_load "$name"
+  if [[ -z "$BK_START" ]]; then
+    bk_up && { echo "$BK_LABEL: up."; return 0; }
+    echo "$BK_LABEL: no answer on $BK_HEALTH_URL, and the plugin gives no start command. ${BK_HINT}" >&2
+    exit 1
+  fi
+  ensure_backend "$BK_LABEL" bk_up "$BK_START" "$BK_WAIT" "$BK_HINT"
+}
+
+# ── the generic `endpoint` backend ───────────────────────────────────────────
+# Any OpenAI-compatible server the engineer already runs (Ollama, LM Studio,
+# vLLM, llama-server…). We do NOT start or stop it: it is not ours, we have no
+# idea what command runs it, and half of them are GUI apps. All we owe the user
+# is an honest health check and a clear message when it is down.
+ENDPOINT_ENABLE=0
+
+# The socat pipe reaches the server as host.docker.internal:$LLM_PORT; from the
+# HOST that same server is on 127.0.0.1 — unless LLM_HOST names another machine
+# (a LAN GPU box is a legitimate choice), in which case we probe it directly.
+endpoint_host() {
+  case "${LLM_HOST:-host.docker.internal}" in
+    host.docker.internal|localhost|"") echo "127.0.0.1" ;;
+    *) echo "${LLM_HOST}" ;;
+  esac
+}
+
+# GET /v1/models, body on stdout. Auth only if a key was configured — sending
+# `Bearer ` with nothing after it upsets some servers more than sending nothing.
+endpoint_models() {
+  local url="http://$(endpoint_host):${LLM_PORT}/v1/models"
+  if [[ -n "${LLM_KEY:-}" ]]; then
+    curl -fsS -m 5 -H "Authorization: Bearer ${LLM_KEY}" "$url" 2>/dev/null
+  else
+    curl -fsS -m 5 "$url" 2>/dev/null
+  fi
+}
+
+# Render dev/opencode-endpoint/opencode.json.tmpl into the project's control dir.
+# It has to be rendered somewhere: opencode wants the model id and the key inside
+# its JSON, and /etc/opencode is mounted :ro so the agent can't be handed the job.
+# The control dir is the one place outside the sandbox mount that is per-project.
+render_endpoint_config() {
+  local dir="$AIRLOCK_CTL/opencode-endpoint" tmpl="$HARNESS_DIR/dev/opencode-endpoint/opencode.json.tmpl"
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  sed -e "s|__LLM_MODEL__|${LLM_MODEL}|g" \
+      -e "s|__LLM_KEY__|${LLM_KEY:-none}|g" \
+      -e "s|__LLM_CONTEXT__|${LLM_CONTEXT:-131072}|g" \
+      -e "s|__LLM_OUTPUT__|${LLM_OUTPUT:-16384}|g" \
+      "$tmpl" > "$dir/opencode.json"
+  chmod 600 "$dir/opencode.json" 2>/dev/null || true
+  printf '%s' "$dir"
+}
+
+# Health check + a model-name sanity check. Never fatal on the name: the server
+# is the authority on what it serves, and a proxy that lists nothing is common.
+endpoint_check() {
+  local body ids
+  echo "endpoint: checking http://$(endpoint_host):${LLM_PORT}/v1/models"
+  if ! body="$(endpoint_models)"; then
+    echo "endpoint: no answer from $(endpoint_host):${LLM_PORT}." >&2
+    echo "  Start your OpenAI-compatible server (Ollama, LM Studio, vLLM, llama-server…) on that" >&2
+    echo "  port, or fix LLM_HOST/LLM_PORT/LLM_KEY with 'airlock config --edit'. Nothing is" >&2
+    echo "  auto-started for this backend — the server is yours, not the harness's." >&2
+    exit 1
+  fi
+  ids="$(printf '%s' "$body" | models_ids)"
+  if [[ -n "$ids" ]] && ! printf '%s\n' "$ids" | grep -qx -- "$LLM_MODEL"; then
+    echo "endpoint: WARNING — the server does not list '$LLM_MODEL'. It serves:" >&2
+    printf '%s\n' "$ids" | sed 's/^/    /' >&2
+    echo "  Set LLM_MODEL to one of those ('airlock config --edit') if calls fail." >&2
+  fi
+}
+
+# Generic: if `check` fails, run `start`, then poll `check` until it passes.
+ensure_backend() {
+  local label="$1" check="$2" start="$3" wait="$4" hint="$5"
+  if "$check"; then echo "${label}: already up."; return 0; fi
+  echo "${label}: not reachable — starting via: ${start}"
+  # shellcheck disable=SC2086
+  ${start}
+  echo -n "${label}: waiting"
+  for _ in $(seq 1 "$wait"); do
+    if "$check"; then echo " — ready."; return 0; fi
+    echo -n "."; sleep 1
+  done
+  echo
+  echo "${label}: still not answering after ${wait}s. ${hint}" >&2
+  exit 1
+}
+
+ensure_llm() {
+  if [[ "${ENDPOINT_ENABLE}" == "1" ]]; then
+    endpoint_check
+  elif [[ -n "$BACKEND_SELECTED" ]]; then
+    bk_ensure "$BACKEND_SELECTED"
+  fi
+}
+
+# ── model picker ──────────────────────────────────────────────────────────────
+# LOCAL_MODEL picks the backend + the matching opencode config. It also sets
+# LLM_TARGET_PORT — the ONE host port the single `llm` door forwards to. The door
+# answers as llm:8080, llm2:8000 and llm3:8090 (aliases + three listeners) so a plugin
+# or opencode config may use a distinct hostname per backend; only the far end is singular.
+#   endpoint  any OpenAI-compatible server the user already runs, described by
+#             LLM_HOST/LLM_PORT/LLM_MODEL/LLM_KEY in the project config; never
+#             started or stopped by us (dev/opencode-endpoint, rendered per project)
+#   off       no door at all (cloud harnesses only)
+#   <plugin>  a backend from the plugin (BACKENDS_EXTRA): started, stopped and
+#             health-checked here, with the port/model/opencode dir it names
+#   ask       prompt every startup at a TTY; otherwise the non-interactive default
+# Unset = no picker: raw callers get compose's default door and start nothing.
+# airlock defaults LOCAL_MODEL=ask; pin it in the project's config to skip the prompt.
+BACKEND_SELECTED=""
+endpoint_configured() { [[ -n "${LLM_PORT:-}" && -n "${LLM_MODEL:-}" ]]; }
+
+local_model_names() { echo "endpoint off${BACKENDS_EXTRA:+ $BACKENDS_EXTRA}"; }
+
+apply_local_model() {
+  case "$1" in
+    endpoint)
+      endpoint_configured || {
+        echo "sandbox-run: LOCAL_MODEL=endpoint needs LLM_PORT and LLM_MODEL in the project config ('airlock config --edit')." >&2
+        exit 1; }
+      [[ -n "${AIRLOCK_CTL:-}" ]] || {
+        echo "sandbox-run: LOCAL_MODEL=endpoint is an airlock backend — its opencode config is rendered into the project's control dir, which only airlock knows." >&2
+        exit 1; }
+      ENDPOINT_ENABLE=1
+      export LLM_TARGET_PORT="$LLM_PORT"
+      # Rendering writes the server's API key to disk; skip it entirely when no
+      # opencode config is mounted anyway.
+      [[ "$OPENCODE_DIR_PINNED" == "1" ]] || oc_dir "$(render_endpoint_config)"
+      llm_env "http://llm:8080/v1" "${LLM_KEY:-none}"
+      export LLM_MODEL
+      echo "model: $LLM_MODEL (endpoint $(endpoint_host):$LLM_PORT)" ;;
+    off)
+      # No door at all: bin/harness leaves the `llm` profile out and removes any
+      # container left from an earlier launch, so llm/llm2/llm3 stop resolving and
+      # no host port is reachable from the sandbox.
+      export LLM_DOOR=0
+      echo "model: no local backend (no LLM door — no host port reachable)" ;;
+    *)
+      bk_known "$1" || {
+        echo "LOCAL_MODEL='$1' unknown ($(local_model_names | sed 's/ / | /g') | ask)" >&2; exit 1; }
+      bk_load "$1"
+      BACKEND_SELECTED="$1"
+      # The door reaches the host loopback through host.docker.internal; a plugin
+      # backend is by definition on this machine.
+      export LLM_HOST=host.docker.internal
+      export LLM_TARGET_PORT="$BK_PORT"
+      oc_dir "$BK_OPENCODE_DIR"
+      llm_env "$BK_URL" "$BK_KEY"
+      export LLM_MODEL="$BK_MODEL"
+      echo "model: $BK_LABEL (:$BK_PORT)" ;;
+  esac
+}
+
+# What `ask` means when nobody can be asked (no TTY, or `verify`): a plugin backend
+# that is already serving, else the plugin's default, else a configured endpoint,
+# else no door. Probes only — never starts anything.
+ask_default() {
+  local b
+  for b in $BACKENDS_EXTRA; do
+    bk_known "$b" || continue
+    bk_load "$b"
+    if bk_up; then echo "$b"; return 0; fi
+  done
+  if [[ -n "$BACKENDS_DEFAULT" ]] && bk_known "$BACKENDS_DEFAULT"; then echo "$BACKENDS_DEFAULT"
+  elif endpoint_configured; then echo endpoint
+  else echo off
+  fi
+}
+
+pick_backend() {
+  [[ -n "${LOCAL_MODEL:-}" ]] || return 0
+  local choice="$LOCAL_MODEL" names=() b i def=0 running="" ans label
+  if [[ "$choice" == "ask" ]]; then
+    if [[ -t 0 ]]; then
+      # Always ask, even if a backend is already up — just show what's running.
+      for b in $BACKENDS_EXTRA; do
+        bk_known "$b" || continue
+        bk_load "$b"
+        bk_up && running="${running:+$running, }$b on :$BK_PORT"
+        names[${#names[@]}]="$b"
+      done
+      # Offered only when the project actually described an endpoint — a menu
+      # entry that cannot work is worse than one that isn't there.
+      endpoint_configured && names[${#names[@]}]=endpoint
+      names[${#names[@]}]=off
+      [[ -n "$running" ]] && echo "(already running: $running)"
+      echo "Pick a local model:"
+      for i in "${!names[@]}"; do
+        b="${names[$i]}"
+        case "$b" in
+          endpoint) label="$LLM_MODEL  (your own server on $(endpoint_host):$LLM_PORT)" ;;
+          off)      label="none (cloud harnesses only — no LLM door)" ;;
+          *)        bk_load "$b"; label="$BK_LABEL" ;;
+        esac
+        if [[ "$def" == 0 && ( "$b" == "$BACKENDS_DEFAULT" || ( -z "$BACKENDS_DEFAULT" && "$b" != off ) ) ]]; then
+          def=$((i+1)); label="$label  [default]"
+        fi
+        printf '  %d) %-8s %s\n' "$((i+1))" "$b" "$label"
+      done
+      [[ "$def" == 0 ]] && def="${#names[@]}"
+      read -r -p "model [1-${#names[@]}, Enter = $def]: " ans
+      case "$ans" in ''|*[!0-9]*) ans="$def" ;; esac
+      [[ "$ans" -ge 1 && "$ans" -le "${#names[@]}" ]] || ans="$def"
+      choice="${names[$((ans-1))]}"
+    else
+      choice="$(ask_default)"
+      echo "model: LOCAL_MODEL=ask with no terminal — using '$choice'."
+    fi
+  fi
+  apply_local_model "$choice"
+}
+
+CMD="${1:-shell}"
+
+# `stop`: full shutdown — container first, then the plugin backends we manage.
+# Not the `endpoint` backend: we never started that server, so we don't get to
+# stop it (it may well be serving something else on the host at the same time).
+if [[ "$CMD" == "stop" ]]; then
+  "$HARNESS" down "$PROJECT" || true
+  if [[ "${LOCAL_MODEL:-}" == "endpoint" ]]; then
+    echo "endpoint: leaving your server on $(endpoint_host):${LLM_PORT:-?} running — it isn't ours to stop."
+    exit 0
+  fi
+  # Every plugin backend still running — whichever project or picker started it.
+  for b in $BACKENDS_EXTRA; do
+    bk_known "$b" || continue
+    bk_load "$b"
+    bk_running && bk_stop
+  done
+  exit 0
+fi
+
+# ── verify ────────────────────────────────────────────────────────────────────
+# `airlock verify` proves the boundary instead of trusting it, and checks the
+# posture the project asked for on top. The probes themselves live in
+# bin/lib/airlock-verify.sh (sourced the same self-located way `bin/airlock`
+# sources its libraries); this file provides what they read: $HARNESS, $PROJECT,
+# wl_file, ask_default and pick_backend.
+if [[ "$CMD" == "verify" ]]; then
+  . "$HARNESS_DIR/bin/lib/airlock-verify.sh"
+  airlock_verify
+fi
+
+# `deps`: show where to add dependencies + the stacks airlock.json defines.
+if [[ "$CMD" == "deps" ]]; then
+  echo "── Sandbox tools (edit dev/Dockerfile, rebuilt on next up) ──────────"
+  grep -nE 'apt-get install|npm install -g|pip install' "$HARNESS_DIR/dev/Dockerfile" || true
+  echo
+  # One parametrised image now: the stacks are entries in airlock.json, not files.
+  . "$HARNESS_DIR/bin/lib/airlock-kit.sh"
+  echo "── Stacks ($(kit_file); set STACK= — or COMPONENTS= — in the project config) ─"
+  for s in $(kit_stack_list); do
+    printf '  %-16s %s\n' "$s" "$(kit_stack_comps "$s")"
+  done
+  echo "  harnesses: $(kit_harness_list)   per-project extras: COMPONENTS=$(echo $KIT_EXTRAS | tr ' ' ',')"
+  echo
+  # The pickers LOCAL_MODEL accepts here: the two shipped ones, then the plugin's.
+  echo "── LLM backends (set LOCAL_MODEL= in the project config; ask = prompt) ─"
+  printf '  %-16s %s\n' endpoint "your own OpenAI-compatible server (LLM_HOST/LLM_PORT/LLM_MODEL/LLM_KEY)"
+  printf '  %-16s %s\n' off "no LLM door (cloud harnesses only)"
+  if [[ -n "$BACKENDS_EXTRA" ]]; then
+    for b in $BACKENDS_EXTRA; do
+      if bk_known "$b"; then bk_load "$b"; printf '  %-16s %s\n' "$b" "$BK_LABEL (:$BK_PORT)"
+      else printf '  %-16s %s\n' "$b" "(listed in BACKENDS_EXTRA, but no backend_$b function)"; fi
+    done
+    echo "  plugin: $BACKENDS_FILE"
+  else
+    echo "  (no backends plugin — see README.md, 'LLM backends')"
+  fi
+  echo
+  # Recipes of the caller's own live in DEV_CONTEXT (selected with DEV_DOCKERFILE).
+  # List them only when a context other than dev/ is in force and exists.
+  if [[ -n "${DEV_CONTEXT:-}" && -d "$DEV_CONTEXT" && "$(cd "$DEV_CONTEXT" && pwd)" != "$HARNESS_DIR/dev" ]]; then
+    echo "── Extra recipes in DEV_CONTEXT=$DEV_CONTEXT (select with DEV_DOCKERFILE=) ─"
+    ( cd "$DEV_CONTEXT" && ls -1 Dockerfile* 2>/dev/null )
+  fi
+  exit 0
+fi
+
+# `down`: stop just the container (leave the host backends running).
+if [[ "$CMD" == "down" ]]; then
+  exec "$HARNESS" down "$PROJECT"
+fi
+
+# Introspection/proxy verbs: pure passthrough — no backend startup, no picker.
+if [[ "$CMD" == "reload-proxy" || "$CMD" == "denied" ]]; then
+  exec "$HARNESS" "$CMD" "$PROJECT"
+fi
+
+# Auto-update opencode: `latest` as a build ARG never busts Docker's layer
+# cache, so the image keeps whatever version its first build resolved. Instead
+# resolve the concrete latest version from the npm registry and pass it as the
+# build arg — the npm-install layer rebuilds only when a new release exists.
+# Opt out with OPENCODE_AUTOUPDATE=0, or freeze by pinning OPENCODE_VERSION
+# in .env (an explicit pin always wins; we never override it).
+# Under airlock the image carries only the project's harness (AIRLOCK_HARNESSES); a
+# CLI that is not going in needs no registry lookup, and a changed version arg for it
+# would only bust the install layer's cache. Raw callers set nothing: all of them.
+in_image() {   # <harness>
+  [[ -z "${AIRLOCK_HARNESSES:-}" ]] && return 0
+  case " $AIRLOCK_HARNESSES " in *" $1 "*) return 0 ;; esac
+  return 1
+}
+
+resolve_opencode_version() {
+  in_image opencode || return 0
+  [[ "${OPENCODE_AUTOUPDATE:-1}" == "1" ]] || return 0
+  [[ -z "${OPENCODE_VERSION:-}" ]] || return 0
+  grep -qE '^OPENCODE_VERSION=' "$HARNESS_DIR/.env" 2>/dev/null && return 0
+  local v
+  v="$(curl -fsS -m 10 https://registry.npmjs.org/opencode-ai/latest 2>/dev/null \
+      | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)"
+  if [[ -n "$v" ]]; then
+    export OPENCODE_VERSION="$v"
+    echo "opencode: latest is $v (auto-update; pin OPENCODE_VERSION in .env to freeze)"
+  else
+    echo "opencode: npm registry unreachable — keeping the version already in the image"
+  fi
+}
+
+# Auto-update Claude Code: same trick as opencode above — resolve the concrete
+# latest version from npm and pass it as the CLAUDE_CODE_VERSION build arg, so
+# the npm-install layer rebuilds only when a new release exists.
+# Opt out with CLAUDE_CODE_AUTOUPDATE=0, or freeze by pinning CLAUDE_CODE_VERSION
+# in .env (an explicit pin always wins; we never override it).
+resolve_claude_version() {
+  in_image claude || return 0
+  [[ "${CLAUDE_CODE_AUTOUPDATE:-1}" == "1" ]] || return 0
+  [[ -z "${CLAUDE_CODE_VERSION:-}" ]] || return 0
+  grep -qE '^CLAUDE_CODE_VERSION=' "$HARNESS_DIR/.env" 2>/dev/null && return 0
+  local v
+  v="$(curl -fsS -m 10 https://registry.npmjs.org/@anthropic-ai/claude-code/latest 2>/dev/null \
+      | sed -n 's/.*"version":"\([^"]*\)".*/\1/p' || true)"
+  if [[ -n "$v" ]]; then
+    export CLAUDE_CODE_VERSION="$v"
+    echo "claude: latest is $v (auto-update; pin CLAUDE_CODE_VERSION in .env to freeze)"
+  else
+    echo "claude: npm registry unreachable — keeping the version already in the image"
+  fi
+}
+
+# ── egress hints ──────────────────────────────────────────────────────────────
+# Egress is whitelist-only; a cloud harness whose squid block is commented out
+# just hangs on login/API calls. Check the ACTIVE whitelist (squid.conf +
+# EXTRA_WHITELIST file) for the domains the chosen verb needs and say so up
+# front, instead of letting the first run stall silently. opencode against the
+# local backends needs no egress at all (internal socat pipes, no proxy).
+wl_covers() {  # true if the effective whitelist has a line matching the domain regex $1
+  grep -Eq "^[[:space:]]*[^#[:space:]].*$1" "$(wl_file)" 2>/dev/null
+}
+wl_hint() {  # $1 = harness label, $2 = human domain list
+  echo "sandbox-run: HINT — '$CMD' needs egress to $2, but the effective whitelist ($(wl_file)) does not open it." >&2
+  echo "  Under airlock that block comes from HARNESS=; otherwise add the domains to the list, then run 'reload-proxy' — or the login/API calls will hang." >&2
+}
+case "$CMD" in
+  claude)  wl_covers '\.anthropic\.com' || wl_hint "Claude Code" ".anthropic.com + .claude.ai" ;;
+  copilot) wl_covers '\.githubcopilot\.com' || wl_hint "GitHub Copilot CLI" ".github.com + .githubcopilot.com" ;;
+  codex)   # local LLM by default — cloud egress only matters if OPENAI_BASE_URL points at OpenAI
+    if ! wl_covers '\.openai\.com'; then
+      echo "sandbox-run: note — codex runs against the local LLM as configured; for real OpenAI (OPENAI_BASE_URL) the whitelist needs .openai.com + .chatgpt.com (proxy/whitelist.d/harness-codex.txt, selected by HARNESS=codex) and a 'reload-proxy'." >&2
+    fi ;;
+esac
+
+# Everything else boots the sandbox — ensure backends first.
+shift || true
+resolve_opencode_version
+resolve_claude_version
+pick_backend
+ensure_llm
+exec "$HARNESS" "$CMD" "$PROJECT" "$@"

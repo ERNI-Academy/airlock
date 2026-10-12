@@ -1,0 +1,539 @@
+#!/usr/bin/env bash
+#
+# airlock — global front-end for the sandbox. Run it from any project directory;
+# it reads that project's config, translates it into the env vars `bin/sandbox-run`
+# already understands, and execs that (the single source of truth — this file adds
+# no sandbox logic of its own).
+#
+# The project dir is bind-mounted READ-WRITE at /workspace, so anything inside it
+# is agent-writable — including, once, the `.airlock` file that told this script
+# which image to build, which egress domains to open and which host directories to
+# mount. So the config does not live there any more. Each project's config lives
+# in a HOST-side control dir the sandbox has no path to:
+#
+#   ${AIRLOCK_HOME:-~/.airlock}/<project>-<hash6>/
+#       config                            the KEY=VALUE settings (parsed, never sourced)
+#       env                               the credentials, 0600 (never touched by `import`)
+#       whitelist.txt                     the generated squid list (EXTRA_WHITELIST)
+#       state/{claude,codex,gh,copilot}   the tool-state mounts
+#       state/unused/…                    empty placeholders for the harnesses not in play
+#       opencode-endpoint/opencode.json   rendered for LOCAL_MODEL=endpoint
+#       opencode-none/                    empty: mounted at /etc/opencode when the
+#                                         harness is not opencode
+#
+#   airlock init [--stack S]   write this project's config (in the control dir); without
+#                              --stack at a terminal it asks (the first-launch wizard)
+#   airlock import [file]      review + adopt a file (default ./.airlock) as the config
+#   airlock config [--edit]    print the control dir + config, or open it in $EDITOR
+#   airlock config --secrets   open the credentials file in $EDITOR (created 0600)
+#   airlock                    shell in the sandbox (default)
+#   airlock claude|codex|copilot|oc    run THE harness (the one HARNESS names; the
+#                              other three verbs are refused — one harness per project)
+#   airlock run <cmd…>         run an arbitrary command in the sandbox
+#   airlock -C <dir> <cmd>     sandbox <dir> instead of the current dir
+#   airlock --force <cmd>      skip the parent-of-many-projects launch guard
+#   airlock down               stop the container (leave host LLMs up)
+#   airlock reload-proxy       reload the egress whitelist (squid -k reconfigure)
+#   airlock stop               container + the host LLM backends a plugin started
+#   airlock verify             prove the boundary: run probes inside the sandbox,
+#                              PASS/FAIL per line, non-zero exit on any FAIL
+#   airlock deps               list addable dependencies / stack variants
+#   airlock denied             show proxy egress denials
+#   airlock gc [--dry-run] [--days N] [--all-stale]
+#                              remove orphaned/stale per-project sandbox images and
+#                              airlock's dangling build leftovers (works from any dir)
+#   airlock help               the verb list (also --help, -h)
+#
+# This file is the DISPATCHER: options, verb routing, the launch-path order and the
+# final exec. The machinery lives in sourced libraries next to it (functions only):
+#
+#   bin/lib/airlock-kit.sh        airlock.json — what the image can be built with
+#   bin/lib/airlock-config.sh     the control dir, config + secrets, state mounts
+#   bin/lib/airlock-whitelist.sh  the composed egress list
+#   bin/lib/airlock-init.sh       the config writer, stack detection, first-launch wizard
+#   bin/lib/airlock-gc.sh         sandbox-image garbage collection (`gc`, the launch sweep)
+#
+# Install: put this repo's bin/ on your PATH (see README). The first launch verb in a
+# project with no config runs a short wizard at a terminal (stack, harness), or
+# refuses with the `airlock init --stack <s>` line anywhere else — never a silent
+# default.
+set -euo pipefail
+
+# Self-locate the repo from this script's own path — works when bin/ is on PATH.
+HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+NAME=airlock   # for messages
+
+# The kit config (repo-root airlock.json): which harness CLIs, components and STACK
+# names the sandbox image can be built with. Sourced via this script's own
+# self-located HARNESS_DIR, so it works with bin/ on PATH from anywhere.
+. "$HARNESS_DIR/bin/lib/airlock-kit.sh"
+. "$HARNESS_DIR/bin/lib/airlock-backends.sh" # where the backends plugin lives
+. "$HARNESS_DIR/bin/lib/airlock-config.sh"   # control dir, config + secrets, state mounts
+. "$HARNESS_DIR/bin/lib/airlock-whitelist.sh" # the composed egress list
+. "$HARNESS_DIR/bin/lib/airlock-init.sh"      # config writer, detection, first-launch wizard
+. "$HARNESS_DIR/bin/lib/airlock-gc.sh"        # sandbox-image gc + the launch-time sweep
+
+# The stack `init` writes when not told otherwise, and the one the few verbs that
+# still run without a config (lifecycle, verify) fall back to. It used to be
+# java-angular — a ~6.5 GB JDK + Angular image nobody asked for.
+DEFAULT_STACK="base"
+
+# ── run-path options ──────────────────────────────────────────────────────────
+# Leading options (any order): --force bypasses the launch-dir guard; -C <dir>
+# sandboxes <dir> instead of the cwd. Parsed before the
+# verb so `-C` also picks the project whose config init/import/config act on.
+force=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force) force=1; shift ;;
+    -C) dir="${2:?-C needs a directory}"; cd "$dir" || exit 1; shift 2 ;;
+    -C*) cd "${1#-C}" || exit 1; shift ;;
+    *) break ;;
+  esac
+done
+
+# The project to sandbox is the current directory (after any -C), and it is also
+# what keys the control dir.
+export PROJECT="$PWD"
+cmd="${1:-shell}"
+
+# ── help + unknown verbs ──────────────────────────────────────────────────────
+# Both answered here, before anything reads a config, loads the kit, creates a
+# control dir or checks a backend: a typo must not start (or half-start) anything.
+case "$cmd" in
+  help|--help|-h)
+    cat <<EOF
+usage: airlock [-C <dir>] [--force] [<verb> [args…]]
+
+  airlock init [--stack S]     Write this project's config into the control dir. Fresh only.
+                               Without --stack, at a terminal it runs the first-launch wizard.
+  airlock import [file]        Review a config file (default ./.airlock) and adopt it as this
+                               project's config. Interactive, TTY only.
+  airlock config               Print the control dir, the config, the effective settings and
+                               the names in the secrets file.
+  airlock config --edit        Open the config in \$EDITOR, then re-parse it.
+  airlock config --secrets     Open the credentials file (created 0600).
+  airlock                      Shell in the sandbox (the default verb).
+  airlock claude|codex|copilot|oc
+                               Run the harness. The other three verbs are refused — one
+                               harness per project.
+  airlock run <cmd…>           Run any command in the sandbox (no -- separator).
+  airlock verify               Build, boot, and run the boundary + posture probes.
+  airlock up                   Start the stack without opening a session.
+  airlock down                 Stop the container; host LLM backends stay up.
+  airlock stop                 Container and the host backends a backends plugin manages.
+  airlock denied               Show the proxy's TCP_DENIED lines.
+  airlock reload-proxy         Force squid to re-read the whitelist (normally automatic).
+  airlock deps                 Where to add tools, the stacks airlock.json defines, the
+                               backend pickers in force.
+  airlock gc [--dry-run] [--days N] [--all-stale]
+                               Remove per-project sandbox images that are dead weight on the
+                               Docker VM disk. Works from any dir.
+  airlock help                 This list.
+
+  -C <dir>                     Act on <dir> instead of the current one.
+  --force                      Skip the launch-dir guard (R2).
+
+Full documentation: $HARNESS_DIR/README.md
+EOF
+    exit 0 ;;
+  init|import|config|shell|oc|claude|codex|copilot|run|verify|up|down|stop|denied|reload-proxy|deps|gc) : ;;
+  *)
+    echo "$NAME: unknown verb '$cmd' — try '$NAME help'" >&2
+    exit 2 ;;
+esac
+
+# ── gc ──────────────────────────────────────────────────────────────────────
+# Machine-wide, not per project: it walks AIRLOCK_HOME and the image list, so it
+# needs no config, creates no control dir and runs from any directory. Handled here
+# rather than in sandbox-run because its whole input is the control-dir tree, which
+# this front-end owns (raw sandbox-run/harness callers have no control dirs).
+if [[ "$cmd" == "gc" ]]; then
+  shift
+  gc_main "$@"
+  exit $?
+fi
+
+# ── init ────────────────────────────────────────────────────────────────────
+# `init --stack S` writes the config non-interactively. Plain `init` at a terminal
+# runs the same wizard a first launch does; plain `init` anywhere else writes the
+# default stack (base). Either way the config comes out of init_write_config.
+if [[ "$cmd" == "init" ]]; then
+  shift
+  stack=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --stack) stack="${2:?--stack needs a value}"; shift 2 ;;
+      --stack=*) stack="${1#--stack=}"; shift ;;
+      *) echo "$NAME init: unknown arg '$1'" >&2; exit 1 ;;
+    esac
+  done
+  ctl_init "$PWD"
+  if [[ -e "$CTL/config" ]]; then
+    echo "$NAME: this project already has a config: $CTL/config" >&2
+    echo "  edit it with '$NAME config --edit', or delete it to re-init." >&2
+    exit 1
+  fi
+
+  init_comps=""; init_lm=off   # off a terminal: no LLM door until someone asks for one
+  if [[ -z "$stack" && -t 0 && -t 2 ]]; then
+    init_wizard "$PWD" || exit 1
+    stack="$WIZ_STACK"; init_harness="$WIZ_HARNESS"; init_comps="$WIZ_COMPONENTS"; init_lm="$WIZ_LOCAL_MODEL"
+  else
+    stack="${stack:-$DEFAULT_STACK}"
+    if ! kit_stack_known "$stack"; then       # validate before writing
+      echo "$NAME: unknown stack '$stack' (airlock.json defines: $(kit_stack_list))" >&2
+      exit 1
+    fi
+    init_harness="opencode"
+    kit_harness_known "$init_harness" || init_harness="$(kit_harness_list)"
+    init_harness="${init_harness%% *}"
+  fi
+  init_write_config "$PWD" "$stack" "$init_harness" "$init_comps" "$init_lm"
+  [[ -n "${WIZ_LLM_KEY:-}" ]] && init_write_key "$WIZ_LLM_KEY"
+  echo "$NAME: wrote $CTL/config (STACK=$stack LOCAL_MODEL=$init_lm) for $PWD"
+
+  # Validate what we just wrote — a generated config the parser rejects is a bug
+  # worth surfacing here rather than at the next launch.
+  conf_read "$CTL/config" || true
+  parse_config
+  show_effective
+  echo "  edit it with '$NAME config --edit', then run '$NAME' (shell) or '$NAME $(harness_verb "$init_harness")'."
+  exit 0
+fi
+
+# ── import ──────────────────────────────────────────────────────────────────
+# Adopt a config file (default ./.airlock) as THIS project's config. The file may
+# well come from inside the sandbox — a leftover `.airlock`, a template a teammate
+# committed — so adopting it is a deliberate, interactive act: settings on screen,
+# y/N at a terminal, and never a step that happens on its own during a launch.
+if [[ "$cmd" == "import" ]]; then
+  shift
+  src="${1:-$PWD/.airlock}"
+  [[ "$src" == /* ]] || src="$PWD/$src"
+  if [[ ! -f "$src" ]]; then
+    echo "$NAME: no file to import at $src" >&2
+    exit 1
+  fi
+  ctl_init "$PWD"
+  conf_read "$src" || exit 1
+  parse_config
+  echo "$NAME: importing $src as the config for $PWD"
+  show_effective
+  if [[ -f "$CTL/config" ]]; then
+    echo "  this REPLACES the existing $CTL/config"
+  fi
+  if [[ ! -t 0 || ! -t 2 ]]; then
+    echo "$NAME: refusing to import without a terminal to confirm on — run '$NAME import' interactively." >&2
+    exit 1
+  fi
+  ans=""
+  read -r -p "Adopt this as the config for $PWD? [y/N] " ans || ans=""
+  case "$ans" in
+    y|Y|yes|YES) : ;;
+    *) echo "$NAME: not imported — nothing changed." >&2; exit 1 ;;
+  esac
+  {
+    echo "# ${NAME} config for $PWD — imported from $src on $(date '+%Y-%m-%d')."
+    printf '%s\n' "$conf_content"
+  } > "$CTL/config"
+  chmod 600 "$CTL/config" 2>/dev/null || true
+  echo "$NAME: wrote $CTL/config"
+  echo "  $src has no effect where it is — delete it."
+  exit 0
+fi
+
+# ── config ──────────────────────────────────────────────────────────────────
+if [[ "$cmd" == "config" ]]; then
+  shift
+  ctl_init "$PWD"
+  if [[ "${1:-}" == "--edit" ]]; then
+    if [[ ! -f "$CTL/config" ]]; then
+      echo "$NAME: no config for $PWD yet — run '$NAME init' first." >&2
+      exit 1
+    fi
+    "${EDITOR:-vi}" "$CTL/config"
+    conf_read "$CTL/config" || exit 1
+    parse_config          # fatal if the edit broke it
+    show_effective
+    exit 0
+  fi
+  # The credentials, in their own file. Separate from `config` so that handing a
+  # config to a teammate — or `import`ing one — can never carry a key with it.
+  if [[ "${1:-}" == "--secrets" ]]; then
+    if [[ ! -f "$CTL/env" ]]; then
+      ( umask 077
+        cat > "$CTL/env" <<EOF
+# ${NAME} credentials for $PWD — one NAME=value per line, no quotes needed.
+# Parsed as data, never sourced. Only these names are accepted:
+#   $CRED_NAMES
+#   LLM_KEY   (the LOCAL_MODEL=endpoint server's key; wins over one in the config)
+# Only the ones the selected HARNESS can use are passed into the sandbox; every
+# other name on that list is passed in EMPTY, so a key exported in your shell for
+# something else cannot ride along. This file is never read or written by
+# '${NAME} import'.
+EOF
+      )
+      echo "$NAME: created $CTL/env (mode 0600)."
+    fi
+    chmod 600 "$CTL/env" 2>/dev/null || true
+    "${EDITOR:-vi}" "$CTL/env"
+    read_secrets          # fatal if the edit broke it
+    names="$(sec_names)"
+    echo "$NAME: $CTL/env holds: ${names:-nothing}"
+    exit 0
+  fi
+  echo "$NAME: control dir: $CTL"
+  if [[ -f "$CTL/config" ]]; then
+    echo "$NAME: config for $PWD:"
+    sed 's/^/    /' "$CTL/config"
+    conf_read "$CTL/config" || true
+    parse_config
+    show_effective
+  else
+    echo "$NAME: no config for $PWD yet — run '$NAME init'."
+  fi
+  # Names only. The values are the one thing this command must never print.
+  if [[ -f "$CTL/env" ]]; then
+    read_secrets
+    names="$(sec_names)"
+    echo "$NAME: secrets ($CTL/env): ${names:-none set}   ('$NAME config --secrets' to edit)"
+  else
+    echo "$NAME: no secrets file — '$NAME config --secrets' creates one."
+  fi
+  exit 0
+fi
+
+# ── launch-dir guard ──────────────────────────────────────────────────────────
+# The current dir is bind-mounted read-write at /workspace. That's fine for ONE
+# project (the accepted blast radius), but launching from a *parent of several
+# projects* would expose them all. Refuse that, and always show what's mounted.
+# Only guards session-launching commands; lifecycle/introspection is exempt.
+case "$cmd" in
+  down|stop|denied|deps|reload-proxy|up) : ;;   # lifecycle/introspection: exempt. NB `up` does
+                                   # bind-mount $PWD at /workspace, but it starts
+                                   # no agent session, so it skips the guard too.
+  *)
+    echo "$NAME: sandboxing $PWD → /workspace"
+    if [[ "$force" -ne 1 ]]; then
+      unsafe=""
+      if [[ "$PWD" == "$HOME" || "$PWD" == "/" ]]; then
+        unsafe="$PWD is your whole home/root"
+      elif [[ ! -e .git ]]; then
+        # No repo of our own → count immediate child repos; ≥2 ⇒ folder-of-projects.
+        n=0
+        for d in */; do [[ -e "$d/.git" ]] && n=$((n+1)); [[ "$n" -ge 2 ]] && break; done
+        [[ "$n" -ge 2 ]] && unsafe="$PWD looks like a parent of several projects"
+      fi
+      if [[ -n "$unsafe" ]]; then
+        echo "$NAME: refusing — $unsafe, so the agent could reach every project under it." >&2
+        echo "  cd into the specific project first, or re-run with '$NAME --force $cmd' to mount all of it." >&2
+        exit 1
+      fi
+    fi
+    ;;
+esac
+
+# ── first launch: no config, no guessing ──────────────────────────────────────
+# A verb that builds or boots the sandbox needs to know WHAT to build, and a silent
+# default here is how a Python project ended up with a JDK + Angular image. So: at a
+# terminal, ask (the wizard writes the config exactly as `init` would, then the verb
+# carries on); anywhere else, refuse with the line that fixes it. Lifecycle and
+# introspection verbs (down/stop/denied/deps/reload-proxy/verify) are not in the
+# list — they keep the fallback below. Raw bin/harness
+# callers (scripts) never come through here at all.
+ctl_init "$PWD"
+case "$cmd" in
+  shell|oc|claude|codex|copilot|run|up) needs_config=1 ;;
+  *) needs_config=0 ;;
+esac
+if [[ "$needs_config" == 1 && ! -f "$CTL/config" ]]; then
+  kit_load        # a broken airlock.json says so before anything else does
+  if [[ -t 0 && -t 2 ]]; then
+    # A verb that names the harness (`airlock claude`, `oc`, …) IS the answer to the
+    # harness question — the wizard states it and moves on. `shell`/`run`/`up` ask.
+    case "$cmd" in
+      claude|codex|copilot) wiz_want="$cmd" ;;
+      oc) wiz_want=opencode ;;
+      *) wiz_want="" ;;
+    esac
+    init_wizard "$PWD" "$wiz_want" || exit 1
+    init_write_config "$PWD" "$WIZ_STACK" "$WIZ_HARNESS" "$WIZ_COMPONENTS" "$WIZ_LOCAL_MODEL"
+    [[ -n "${WIZ_LLM_KEY:-}" ]] && init_write_key "$WIZ_LLM_KEY"
+    echo "$NAME: wrote $CTL/config${WIZ_LLM_KEY:+ (and LLM_KEY to $CTL/env)}" >&2
+    echo "  $(wizard_summary "$WIZ_STACK" "$WIZ_HARNESS" "$WIZ_COMPONENTS" "$WIZ_LOCAL_MODEL")" >&2
+    echo >&2
+  else
+    echo "$NAME: no config for $PWD — refusing to guess what to build." >&2
+    echo "  Run, in $PWD:" >&2
+    echo "      $NAME init --stack <$(kit_stack_list | sed 's/ /|/g')>" >&2
+    echo "  or run '$NAME $cmd' once at a terminal for the first-launch wizard." >&2
+    exit 1
+  fi
+fi
+
+# ── config ────────────────────────────────────────────────────────────────────
+# Defaults set BEFORE the config is applied, so an ambient value in the launching
+# shell cannot decide any of them — only this file's defaults or the project config.
+STACK="$DEFAULT_STACK"        # default when the project (or its config) names none
+COMPONENTS=""                 # empty = the stack's own component set
+WHITELIST=""
+HARNESS="opencode"            # one harness per project (see below)
+GH="off"                      # gh state mounted only on request
+GC="on"                       # the launch-time image sweep
+GC_DAYS="$GC_DEFAULT_DAYS"    # how long THIS project's image survives unlaunched
+if conf_read "$CTL/config"; then
+  parse_config
+  apply_config
+else
+  echo "$NAME: no config for this project — using defaults (STACK=$STACK) for '$cmd'. Run '$NAME init' to write one." >&2
+fi
+if stray="$(stray_conf_dir)"; then
+  echo "$NAME: note — $stray/.airlock is NOT read (project files are agent-writable); the config is $CTL/config. Adopt it with '$NAME import $stray/.airlock', then delete it." >&2
+fi
+if [[ -f "$PWD/.airlock-whitelist" ]]; then
+  echo "$NAME: note — $PWD/.airlock-whitelist is no longer read (the list lives in $CTL/whitelist.txt now); you can delete it." >&2
+fi
+
+# ── one harness per project ───────────────────────────────────────────────────
+# A project gets ONE harness. Everything else follows from that: only its state
+# dir is mounted, only its credentials are passed in, and the verb that starts a
+# different one is refused rather than quietly logging you into the wrong account.
+# Compose always declares all four state mounts, so the ones that are not in play
+# get an empty placeholder directory instead — an empty dir mounted at ~/.claude
+# is a Claude Code that has never been logged in, which is exactly the truth.
+# The kit has the last word on what exists. A configured STACK/HARNESS was already
+# checked while parsing; this catches the built-in defaults against a trimmed
+# airlock.json (a kit without base, or without opencode).
+case "$cmd" in
+  down|stop|denied|deps|reload-proxy) : ;;
+  *)
+    if ! kit_stack_known "$STACK"; then
+      echo "$NAME: STACK=$STACK is not a stack in $(kit_file) (it defines: $(kit_stack_list))." >&2
+      echo "  Set STACK in '$NAME config --edit', or add the stack to airlock.json." >&2
+      exit 1
+    fi
+    if ! kit_harness_known "$HARNESS"; then
+      echo "$NAME: HARNESS=$HARNESS is not built into the sandbox image — $(kit_file) lists: $(kit_harness_list)." >&2
+      echo "  Set HARNESS in '$NAME config --edit', or add it to airlock.json (the next launch rebuilds)." >&2
+      exit 1
+    fi ;;
+esac
+
+case "$cmd" in
+  oc|claude|codex|copilot)
+    want="$(harness_verb "$HARNESS")"
+    if [[ "$cmd" != "$want" ]]; then
+      echo "$NAME: this project is configured for HARNESS=$HARNESS, so '$NAME $cmd' is refused." >&2
+      echo "  Use '$NAME $want', or change HARNESS with '$NAME config --edit'." >&2
+      echo "  (One harness per project: that is what keeps each project's logins and keys to itself.)" >&2
+      exit 1
+    fi ;;
+esac
+
+# ── tool state ────────────────────────────────────────────────────────────────
+# Per-tool state (logins, settings) belongs to the PROJECT, not the harness repo —
+# but it must not live INSIDE the project either: the sandbox can write there, and
+# a directory swapped for a symlink would make the next launch bind-mount whatever
+# it points at (0007, amended by 0012). So it defaults into the control dir.
+state_root="$CTL/state"
+export CLAUDE_STATE="${CLAUDE_STATE:-$state_root/claude}"
+export CODEX_STATE="${CODEX_STATE:-$state_root/codex}"
+export GH_STATE="${GH_STATE:-$state_root/gh}"
+export COPILOT_STATE="${COPILOT_STATE:-$state_root/copilot}"
+
+# The order the launch path needs: the mounts are checked and narrowed to the
+# selected harness, the egress list is composed, and only then are the credentials
+# exported (the launch line it prints names the blocks the composer chose).
+case "$cmd" in
+  down|stop|denied|deps) build_whitelist ;;   # keep EXTRA_WHITELIST stable for compose
+  *)
+    mkdir -p "$CLAUDE_STATE" "$CODEX_STATE" "$GH_STATE" "$COPILOT_STATE" 2>/dev/null || true
+    migrate_state "$PWD/.airlock-state"
+    state_check
+    select_state_mounts
+    build_whitelist
+    export_credentials
+    gh_warn
+    ;;
+esac
+
+# The control dir, handed to sandbox-run. LOCAL_MODEL=endpoint renders its
+# opencode.json in there (the model id and key have to be inside that JSON, and
+# /etc/opencode is mounted :ro), so the runner needs to know where "there" is.
+# Not a config key: nothing the agent can write may name a mount source.
+export AIRLOCK_CTL="$CTL"
+
+# The resolved posture, handed to sandbox-run so `verify` can assert the CONFIG and
+# not just the boundary: which harness is in play, whether the gh login was asked
+# for, and which domains the project itself put on the list (as opposed to the ones
+# its stack and harness brought). These are defaults-or-config values, never the
+# launching shell's — they were set before apply_config ran.
+# AIRLOCK_-prefixed on purpose: `sandbox-run` uses the bare name HARNESS for the path
+# to bin/harness, and STACK/GH/WHITELIST are this front-end's vocabulary, not its.
+export AIRLOCK_HARNESS="$HARNESS"
+export AIRLOCK_GH="$GH"
+export AIRLOCK_STACK="$STACK"
+export AIRLOCK_WHITELIST="${WHITELIST:-}"
+export AIRLOCK_WL_BLOCKS="$WL_BLOCKS"    # the blocks that composed whitelist.txt
+
+# Model picker: unless the config pinned a choice, prompt at a terminal or take the
+# non-interactive default (see pick_backend in sandbox-run). Raw sandbox-run callers
+# never set LOCAL_MODEL and get no picker at all.
+export LOCAL_MODEL="${LOCAL_MODEL:-ask}"
+
+# ── opencode's config is opencode's business ──────────────────────────────────
+# compose mounts /etc/opencode unconditionally, so for a project whose harness is
+# NOT opencode the only question is *what* is mounted there. The provider config
+# names a base URL, a model and an API key — a resource the selected harness cannot
+# use and has no business being handed (R3, same argument as 0014's credentials).
+# Mount an empty directory from the control dir instead: nothing in the container
+# reads it.
+if [[ "$HARNESS" != "opencode" ]]; then
+  export OPENCODE_DIR="$CTL/opencode-none"
+  export OPENCODE_DIR_PINNED=1      # tells sandbox-run's picker not to override it
+  mkdir -p "$OPENCODE_DIR" 2>/dev/null || true
+  chmod 700 "$OPENCODE_DIR" 2>/dev/null || true
+fi
+
+# STACK (or COMPONENTS, which wins) → the build args for the one parametrised
+# dev/Dockerfile. DEV_DOCKERFILE stays the escape hatch for other recipes in dev/ (which
+# ignore these args); when the config pinned one, it wins and only the whitelist
+# blocks still follow STACK/COMPONENTS.
+#
+# Only THE harness is installed: the project can start no other (the verbs are
+# refused above), so the other CLIs were dead weight in every image. The image is
+# per project, so this changes nothing for any other project.
+img_harnesses="$(kit_image_harnesses "$HARNESS")"
+kit_export_build_args "$STACK" "$COMPONENTS" "$img_harnesses"
+if [[ -z "${DEV_DOCKERFILE:-}" ]]; then
+  export DEV_DOCKERFILE="Dockerfile"
+fi
+# The build context is always dev/ under airlock: DEV_DOCKERFILE was validated as a
+# file there, and an ambient DEV_CONTEXT (the raw-caller escape hatch for recipes
+# outside dev/) must not redirect a project's build.
+export DEV_CONTEXT="$HARNESS_DIR/dev"
+
+# The image labels docker-compose.yml stamps on the dev image: built by
+# airlock, under this AIRLOCK_HOME. `gc` uses them to tell an airlock project's image
+# (and its dangling leftovers) from a raw `bin/harness` build of the same recipe.
+export AIRLOCK_LAUNCHER=airlock
+export AIRLOCK_IMAGE_HOME="$AIRLOCK_HOME"
+
+# ── launch stamp + image sweep ────────────────────────────────────────────────
+# Every launch verb records when it ran (the `stale` rule's clock), then sweeps
+# OTHER projects' orphaned/stale images. Before the build rather than after: the
+# sweep never touches this project's image or any image a container uses, so the
+# order changes nothing it removes — but a full disk fails the build, and this is
+# the last moment to make room. The exec below replaces this process, so "after"
+# would mean after the session ends.
+if [[ "$needs_config" == 1 ]]; then
+  gc_stamp "$CTL"
+  if [[ "$GC" != "off" ]]; then
+    gc_auto "harness-$(basename "$CTL")-dev" ${COMPOSE_PROJECT_NAME:+"$COMPOSE_PROJECT_NAME-dev"}
+  fi
+  gc_floor_warn
+fi
+
+exec "$HARNESS_DIR/bin/sandbox-run" "$@"

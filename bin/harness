@@ -1,0 +1,109 @@
+#!/usr/bin/env bash
+# Run a sandboxed harness against any project directory.
+#
+#   harness up [dir]        start the sandbox with dir (default: cwd) mounted at /workspace
+#   harness shell [dir]     up + open a bash shell in the sandbox
+#   harness oc [dir]        up + run opencode in the sandbox
+#   harness claude [dir]    up + run Claude Code (permission prompts off — safe HERE, see README)
+#   harness codex [dir]     up + run Codex CLI in the sandbox
+#   harness run [dir] cmd…  up + run an arbitrary command in the sandbox
+#   harness down [dir]      stop the sandbox for that project
+#   harness denied [dir]    show proxy denials for that project's stack
+set -euo pipefail
+
+HARNESS_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+CMD="${1:-shell}"
+DIR="$(cd "${2:-$PWD}" && pwd)"
+
+# One stack per project so two projects can run side by side. A caller that needs several
+# stacks over the SAME directory name (e.g. a script's per-run sandboxes) can pre-export
+# COMPOSE_PROJECT_NAME; otherwise it is basename + a short hash of the FULL path, so
+# ~/a/api and ~/b/api get separate stacks instead of silently sharing one.
+export WORKSPACE="$DIR"
+_hash="$(printf '%s' "$DIR" | shasum | cut -c1-6)"
+export COMPOSE_PROJECT_NAME="${COMPOSE_PROJECT_NAME:-harness-$(basename "$DIR" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9' '-' | sed 's/-*$//')-$_hash}"
+# Image build on `up`. Default rebuilds (--build); export HARNESS_BUILD= (empty) to skip it,
+# which matters when starting many short-lived stacks off an image that is already current.
+BUILD="${HARNESS_BUILD---build}"
+
+# The LLM door is ONE profile-gated service (compose `llm`, also answering as llm2/llm3,
+# forwarding to the single host port ${LLM_TARGET_PORT}). Enable the profile by
+# default so raw callers — scripted stacks above all — get the door without asking
+# for it. bin/sandbox-run exports LLM_DOOR=0 for LOCAL_MODEL=off; then the profile is left out and the container is removed, so the
+# sandbox can reach no host port at all.
+LLM_DOOR="${LLM_DOOR:-1}"
+[[ "$LLM_DOOR" == "1" ]] && export COMPOSE_PROFILES="llm${COMPOSE_PROFILES:+,$COMPOSE_PROFILES}"
+
+# COMPOSE_EXTRA_FILE: an optional second compose file layered on the stack (extra services,
+# build args) for callers that need more than the checked-in stack — bin/airlock never sets it.
+dc() {
+  docker compose -f "$HARNESS_ROOT/docker-compose.yml" \
+    ${COMPOSE_EXTRA_FILE:+-f "$COMPOSE_EXTRA_FILE"} \
+    --project-directory "$HARNESS_ROOT" "$@"
+}
+
+# Bring the stack up, then make a changed egress whitelist actually take effect.
+# The list is a bind-mounted FILE now, and its path no longer changes between
+# launches, so compose sees no config drift and leaves a running squid alone with
+# the list it started with. AIRLOCK_PROXY_RELOAD=1 (set by bin/airlock when the
+# composed list differs from what it last applied) says "re-read it"; the marker is
+# only written once the reload succeeded, so a failed launch reloads again next time.
+up_stack() {
+  dc up -d ${BUILD} || return 1
+  # LOCAL_MODEL=off: leaving the profile out stops compose STARTING the door, but a
+  # container left over from an earlier launch would keep answering. Remove it, with
+  # the profile temporarily on so compose recognises the service name.
+  [[ "$LLM_DOOR" == "1" ]] || COMPOSE_PROFILES=llm dc rm -sf llm >/dev/null 2>&1 || true
+  [[ "${AIRLOCK_PROXY_RELOAD:-0}" == "1" ]] || return 0
+  # To STDERR: `harness run` is how scripted callers (airlock verify, scripts)
+  # read a command's output out of the sandbox, and a status line on stdout would
+  # land in the middle of it.
+  if dc exec -T proxy squid -k reconfigure >/dev/null 2>&1; then
+    echo "proxy: egress whitelist changed — squid reconfigured" >&2
+  else
+    dc up -d --force-recreate proxy >/dev/null || return 1
+    echo "proxy: egress whitelist changed — proxy recreated" >&2
+  fi
+  [[ -n "${AIRLOCK_CTL:-}" && -f "${EXTRA_WHITELIST:-}" ]] \
+    && cp "$EXTRA_WHITELIST" "$AIRLOCK_CTL/whitelist.applied" 2>/dev/null
+  return 0
+}
+
+case "$CMD" in
+  up)     up_stack ;;
+  shell)  up_stack && dc exec dev bash ;;
+  oc)     up_stack && dc exec dev opencode ;;
+  # Skipping permission prompts is the whole point of this sandbox: the
+  # container has no host route, whitelist-only egress, and push disabled,
+  # so "dangerous" here means "free to work". Outside a sandbox, don't.
+  claude) up_stack && dc exec dev claude --dangerously-skip-permissions ;;
+  codex)  up_stack && dc exec dev codex ;;
+  copilot) up_stack && dc exec dev copilot ;;
+  # Anything else: `harness run <dir> <cmd...>` execs the command in the
+  # sandbox (cwd /workspace), e.g.  harness run . gh auth login
+  # -T (no TTY) when stdin isn't one, so scripted callers (`airlock verify`, CI)
+  # don't die on "the input device is not a TTY".
+  run)    shift 2; TT=(); [[ -t 0 ]] || TT=(-T)
+          up_stack && dc exec ${TT[@]+"${TT[@]}"} dev "$@" ;;
+  # The profile named here, so `down` takes the profile-gated LLM door with it
+  # whatever the launch used.
+  down)   COMPOSE_PROFILES=llm dc down ;;
+  # Whitelist edits: squid.conf is bind-mounted, so a running proxy can hot-reload
+  # it; fall back to a recreate (also picks up a changed EXTRA_WHITELIST path).
+  reload-proxy) AIRLOCK_PROXY_RELOAD=1
+                if dc exec -T proxy squid -k reconfigure 2>/dev/null; then
+                  echo "proxy: squid reconfigured — whitelist reloaded"
+                else
+                  dc up -d --force-recreate proxy
+                fi
+                [[ -n "${AIRLOCK_CTL:-}" && -f "${EXTRA_WHITELIST:-}" ]] \
+                  && cp "$EXTRA_WHITELIST" "$AIRLOCK_CTL/whitelist.applied" 2>/dev/null
+                true ;;
+  denied) dc exec proxy grep TCP_DENIED /var/log/squid/access.log || echo "no denials" ;;
+  # The fully-resolved compose file for this project's stack. `airlock verify` reads
+  # it to check the shape of the stack itself (how many host ports the LLM door
+  # forwards to) rather than taking the YAML's word for it.
+  config) shift 2 2>/dev/null || shift $#
+          COMPOSE_PROFILES=llm dc config "$@" ;;
+  *)      echo "usage: harness {up|shell|oc|claude|codex|copilot|run|down|denied|reload-proxy|config} [project-dir] [cmd...]" >&2; exit 1 ;;
+esac

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "_comment": "The DEFAULT config mounted at /etc/opencode when nothing else is chosen (raw `bin/harness` callers). One `local` provider behind the LLM door, http://llm:8080/v1, which forwards to the one host port in LLM_TARGET_PORT. Replace `local-model` with the id your server lists on /v1/models and set the limits to what it was launched with. Under airlock, LOCAL_MODEL=endpoint renders dev/opencode-endpoint/opencode.json.tmpl per project instead, and a backends plugin (README.md, 'LLM backends') can point at its own config dir. Auto-compaction stays off: opencode crashed on a tool call during the summary.",
+  "provider": {
+    "local": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Local (OpenAI-compatible server behind the LLM door)",
+      "options": {
+        "baseURL": "http://llm:8080/v1",
+        "apiKey": "none"
+      },
+      "models": {
+        "local-model": {
+          "name": "local-model (replace with your server's model id)",
+          "limit": {
+            "context": 131072,
+            "output": 16384
+          }
+        }
+      }
+    }
+  },
+  "model": "local/local-model",
+  "compaction": {
+    "auto": false,
+    "prune": true
+  }
+}

@@ -1,0 +1,4 @@
+# Codex CLI — OpenAI API + ChatGPT-plan auth. Not needed when codex runs against a
+# local model (OPENAI_BASE_URL points at the internal `llm` door).
+.openai.com
+.chatgpt.com

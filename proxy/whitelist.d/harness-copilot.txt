@@ -1,0 +1,7 @@
+# GitHub Copilot CLI — device-flow login + the Copilot API.
+# NOTE the blast radius: `.github.com` also unlocks api.github.com, so a copilot
+# project with GH=on has an upload path out of the sandbox. `airlock` warns about
+# exactly that combination. Refine with `airlock denied` if your login works without it.
+.github.com
+.githubcopilot.com
+.githubusercontent.com

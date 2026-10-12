@@ -1,0 +1,25 @@
+# Line-ending discipline for Windows checkouts. Most files here are mounted
+# straight into Linux containers (shell scripts, squid config, compose files,
+# the .env) — if git's autocrlf rewrites them to CRLF, they break in subtle
+# ways (bash: "bad interpreter", squid: parse errors). Force LF for anything
+# a container reads.
+* text=auto
+bin/harness text eol=lf
+bin/airlock text eol=lf
+bin/sandbox-run text eol=lf
+bin/test-airlock-config.sh text eol=lf
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.conf      text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.json      text eol=lf
+.env        text eol=lf
+proxy/squid.conf text eol=lf
+proxy/*.txt text eol=lf
+proxy/whitelist.d/*.txt text eol=lf
+*.tmpl      text eol=lf
+.env.example text eol=lf
+airlock.json text eol=lf
+docker-compose.yml text eol=lf
+dev/Dockerfile text eol=lf

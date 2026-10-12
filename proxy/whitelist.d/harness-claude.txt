@@ -1,0 +1,4 @@
+# Claude Code — API + OAuth login, and its docs fetches.
+.anthropic.com
+.claude.ai
+.claude.com

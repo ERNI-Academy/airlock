@@ -1,0 +1,126 @@
+# airlock config — FORMAT REFERENCE.
+#
+# This file does nothing where it sits. A project's config lives OUTSIDE the
+# project, in its control dir under ~/.airlock/<project>-<hash>/config, because
+# the project itself is bind-mounted read-write into the sandbox — a config the
+# agent can edit is a config that can re-point mounts and widen egress.
+#
+# To use these settings for a project:
+#     airlock init            # writes a starter config in the control dir (asks at a terminal)
+#     airlock config --edit   # edit it
+#     airlock import <file>   # adopt THIS file (or a teammate's) after review
+#
+# Parsed, never sourced: blank lines, # comments and KEY=VALUE only (bare,
+# 'single'- or "double"-quoted). No expansion of any kind — no $VAR, no $(…), no
+# backticks — except a leading ~/ on the *_STATE paths. Keys not on the allow list
+# below are a hard error; mount, control-plane and secret settings (EXTRA_WHITELIST,
+# OPENCODE_DIR, COMPOSE_*, OPENAI_API_KEY…) belong in the harness `.env`, your shell
+# or the project's secrets file.
+#
+#   airlock            shell    airlock claude / codex / copilot / oc
+#   airlock down       stop container    airlock stop  # + host LLMs
+#   airlock deps       list addable dependencies / stacks
+#   airlock gc --dry-run   which sandbox images are dead weight (any dir)
+#   airlock config     show the control dir and the settings in force
+#   airlock config --secrets   edit this project's credentials (a separate file)
+#   airlock help       the full verb list
+
+# Credentials do NOT go in this file. They live in `env` next to the project's
+# config in the control dir (mode 0600), so that handing this file to a teammate —
+# or importing theirs — can never carry a key along. `airlock config --secrets`
+# opens it. Accepted names: OPENAI_API_KEY, OPENROUTER_API_KEY, ANTHROPIC_API_KEY,
+# CLAUDE_CODE_OAUTH_TOKEN. Only the ones the selected HARNESS can use are passed
+# into the sandbox; the rest are passed in EMPTY, which also overrides anything
+# exported in your shell.
+
+# STACK also decides which package registries the egress whitelist opens:
+#   base          npm + PyPI
+#   java-angular  npm + PyPI + Adoptium/Gradle/Maven Central (+ the exact GitHub
+#                 release-download hosts the Gradle wrapper redirects to)
+#   dotnet        npm + NuGet
+#   node          npm
+# The stacks themselves are defined in the repo-root airlock.json, together with
+# which harness CLIs a project may pick. A project with no config gets a short
+# wizard on its first launch at a terminal (or a refusal naming `airlock init
+# --stack <s>` anywhere else) — there is no silent default any more.
+STACK=base                    # base (python+node) | java-angular | dotnet | node
+
+# Pick components one by one instead: overrides STACK's set for BOTH the image
+# build and the egress blocks (STACK stays, as the recipe's name). Comma- or
+# space-separated from node | python | java | angular | dotnet; node is required
+# (the harness CLIs are npm packages). Empty or absent = STACK's set.
+# COMPONENTS=node,python,java
+# `playwright` is an extra, off by default: alone it is ADDED to STACK's set (bakes
+# Playwright + headless Chromium in; no egress), in a list it rides along.
+# COMPONENTS=playwright
+
+# Escape hatch for a recipe of your own (e.g. one with pre-warmed dependency
+# caches): a dev/Dockerfile* variant.
+# DEV_DOCKERFILE=Dockerfile
+# Legacy knobs, still honoured.
+# JDK_VERSION=
+# ANGULAR_VERSION=
+
+# ONE harness per project. Only this one's state dir is mounted (the others get an
+# empty placeholder), only its credentials are passed in, and only ITS vendor domains
+# are whitelisted (.models.dev / .anthropic.com+.claude.* / .openai.com+.chatgpt.com /
+# .github.com+.githubcopilot.com); the verbs that start a different harness are
+# refused; and only its CLI is installed into the image.
+# Change it here, not with a different command.
+HARNESS=opencode              # opencode | claude | codex | copilot
+
+# Mount the gh login. Off by default: a gh token plus a whitelisted .github.com is
+# an upload path out of the sandbox, so it should be a decision, not a leftover.
+# GH=on
+
+# Sandbox-image garbage collection (README.md, "Sandbox images and gc").
+# Every launch sweeps OTHER projects' orphaned/stale sandbox images (labelled ones
+# only; never one a container uses). GC=off skips that sweep on this project's
+# launches. GC_DAYS is how long THIS project's image survives without a launch
+# before a sweep or `airlock gc` removes it (default 30; 0 = never stale).
+# GC=off
+# GC_DAYS=30
+
+# Extra egress domains (space-separated, plain domains only — an optional leading
+# dot, no IPs, wildcards, ports or paths), ON TOP of what STACK and HARNESS already
+# open. proxy/squid.conf carries no domains at all: the whole list is composed here,
+# per project, into whitelist.txt in the control dir. The next launch reloads the
+# proxy by itself when the composed list changed. Add a domain here only when a
+# real run is blocked ('airlock denied' shows it).
+# WHITELIST="artifactory.corp.com pypi.internal"
+
+# Tool state (Claude Code / codex / gh / copilot logins made inside the sandbox)
+# lives in state/ inside the control dir — per project, outside the sandbox mount,
+# created automatically. Override to share one identity across several projects
+# (absolute path, or ~/…; never inside the project, ~/.ssh, ~/.config, …):
+# CLAUDE_STATE=~/clients/acme/state/claude
+# CODEX_STATE=
+# GH_STATE=
+# COPILOT_STATE=
+
+# ANTHROPIC_MODEL=            # Claude Code model; empty = its default
+# LOCAL_MODEL=off             # endpoint | off | ask | a backends-plugin name
+#   endpoint  an OpenAI-compatible server YOU run, local or on the LAN (see below)
+#   off       no LLM door at all — cloud harnesses only (Claude Code, Copilot, or
+#             codex/opencode configured for a cloud provider). What `init` writes
+#             off a terminal.
+#   ask       prompt at every startup (airlock's default if the key is absent)
+#   <name>    a picker registered by a backends plugin — a host-side shell file
+#             (backends.sh at the kit root, or AIRLOCK_BACKENDS) that starts/stops your own
+#             server; README.md, "LLM backends".
+# The picker also sets the backend URL/key and the matching opencode config.
+
+# --- LOCAL_MODEL=endpoint: bring your own OpenAI-compatible server ------------
+# Ollama, LM Studio, vLLM, llama-server, … Nothing is auto-started or stopped:
+# the server is yours. airlock health-checks GET /v1/models before launching and
+# warns if LLM_MODEL isn't in the list. The sandbox reaches it through the `llm`
+# socat pipe, so the port below is the HOST port, never one the agent sees.
+# LLM_PORT=11434              # required: the port your server listens on
+# LLM_MODEL=llama3.1:8b       # required: the model id the server reports
+# LLM_KEY=                    # optional and usually EMPTY — most local servers
+#                             #   need no key at all. Better kept in the secrets
+#                             #   file ('airlock config --secrets'), which wins.
+# LLM_HOST=host.docker.internal   # optional: another machine (a LAN GPU box)
+# LLM_CONTEXT=131072          # optional: opencode's context limit, tokens
+# LLM_OUTPUT=16384            # optional: opencode's max output, tokens
+# Keep LLM_CONTEXT/LLM_OUTPUT at or below what the server was launched with.

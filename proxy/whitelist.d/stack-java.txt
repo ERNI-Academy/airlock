@@ -1,0 +1,17 @@
+# Java — Maven/Gradle dependency resolution and the Temurin JDK.
+# Temurin JDK packages:
+.adoptium.net
+# Gradle wrapper distribution + plugin portal:
+.gradle.org
+# Maven Central (both names Maven/Gradle use):
+.maven.org
+repo.maven.apache.org
+# The Gradle wrapper distribution redirects to a github.com RELEASE ASSET, so the Java
+# stack needs the web host github.com (EXACT) + codeload.github.com + the release-asset
+# CDN .githubusercontent.com. Deliberately NOT `.github.com` (leading dot): that would
+# also open api.github.com, which is the exfil channel (gh api / gist upload).
+# A 2026 review of the Java stack's egress, narrowed after the Gradle-download
+# regression: exact download hosts allowed, api host denied.
+github.com
+codeload.github.com
+.githubusercontent.com

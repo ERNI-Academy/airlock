@@ -1,0 +1,3 @@
+# opencode — fetches its model catalog at startup. Nothing else: the model itself is
+# reached through the internal `llm` door, which never touches the proxy.
+.models.dev
